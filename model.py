@@ -8,14 +8,16 @@ import torch
 import os
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_default_dtype(torch.bfloat16)
 
 BATCH_SIZE = 4
 NUM_WORKERS = int(os.cpu_count() / 2)
+GRAD_ACCUM = 4
 
 
 @dataclass
 class GPT2Config:
-    block_size: int = 1024
+    block_size: int = 512
     vocab_size: int = 50257
     n_layer: int = 6
     n_embd: int = 768
@@ -68,10 +70,14 @@ class GPT2CasualSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        attn = F.softmax(attn, dim=-1)
-        y = attn @ v
+        # attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        # attn = F.softmax(attn, dim=-1)
+        # y = attn @ v
+
+        # Kernelized flash attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.permute(0, 2, 1, 3).reshape(B, T, C)
         y = self.c_proj(y)
         return y
@@ -106,6 +112,24 @@ class SimpleGPT2(nn.Module):
         )
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module: nn.Module):
+        std = 0.02
+        if isinstance(module, nn.Linear):
+            is_residual = any(
+                name in module.__class__.__name__.lower() for name in ["c_proj"]
+            )
+
+            std = (2 * self.config.n_layer) ** -0.5 if is_residual else std
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(
         self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None
@@ -142,16 +166,47 @@ class SimpleGPT2Module(L.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
+        # self.model = torch.compile(SimpleGPT2(config))
         self.model = SimpleGPT2(config)
+        self.automatic_optimization = False
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return self.model(x, y)
 
-    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    def training_step(
+        self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
+    ) -> torch.Tensor:
         x, y = batch
         logits, loss = self(x, y)
+        loss = loss / GRAD_ACCUM
+        optimizer = self.optimizers()
+        scheduler = self.lr_schedulers()
+        self.toggle_optimizer(optimizer)
+        # optimizer.zero_grad()
+        self.manual_backward(loss)
+        norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        self.log("grad_norm", norm, on_step=True, on_epoch=True)
+        if (batch_idx + 1) % GRAD_ACCUM == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+            scheduler.step()
+        self.untoggle_optimizer(optimizer)
+
+        self.log("lr", scheduler.get_last_lr()[0], on_step=True, on_epoch=True)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
+
+    def on_train_epoch_end(self):
+        optimizer = self.optimizers()
+        scheduler = self.lr_schedulers()
+
+        # Final gradient step if any unstepped grads are left
+        if any(p.grad is not None for p in self.parameters()):
+            self.toggle_optimizer(optimizer)
+            optimizer.step()
+            optimizer.zero_grad()
+            scheduler.step()
+            self.untoggle_optimizer(optimizer)
 
     def test_step(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         x, y = batch
@@ -160,10 +215,50 @@ class SimpleGPT2Module(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
+        max_lr = 3e-4
+        min_lr = max_lr * 0.2
+        warmup_steps = 10
+        max_steps = 50
+
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {k: v for k, v in param_dict.items() if v.requires_grad}
+
+        decay_params = [p for p in param_dict.values() if p.ndim >= 2]
+        no_decay_params = [p for p in param_dict.values() if p.ndim < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": 0.1},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+
         optimizer = torch.optim.AdamW(
-            self.parameters(), lr=self.hparams.lr, weight_decay=1e-2
+            optim_groups,
+            lr=max_lr,
+            betas=(0.9, 0.95),
+            eps=1e-8,
         )
-        return optimizer
+
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                # Linear warmup
+                return max_lr * (current_step + 1 / warmup_steps)
+            elif current_step > max_steps:
+                return min_lr
+            else:
+                # Cosine decay
+                progress = (current_step - warmup_steps) / (max_steps - warmup_steps)
+                cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                return (min_lr / max_lr) + (1 - (min_lr / max_lr)) * cosine_decay
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
 
     def run_inference(self, x: torch.Tensor, max_tokens: int = 128):
         self.eval()

@@ -51,7 +51,7 @@ class SimpleGPT2DataModule(L.LightningDataModule):
 
     def setup(self, stage: str = None):
         if stage == "fit" or stage is None:
-            dataset_full = GPTTextDataset(self.tokens[:150], self.seq_len)
+            dataset_full = GPTTextDataset(self.tokens[:128], self.seq_len)
             self.train_dataset, self.val_dataset = random_split(
                 dataset_full, [0.7, 0.3]
             )
